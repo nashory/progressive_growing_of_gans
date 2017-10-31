@@ -258,7 +258,7 @@ class LODSelectLayer(lasagne.layers.MergeLayer):
         t = self.cur_lod - self.first_incoming_lod
         r = v[hi]
         for i in xrange(hi-1, lo-1, -1): # i = hi-1, hi-2, ..., lo
-            r = theano.ifelse.ifelse(T.lt(t, i+1), v[i] * ((i+1)-t) + v[i+1] * (t-i), r)
+            r = theano.ifelse.ifelse(T.lt(t, i+1), v[i] * ((i+1)-t) + v[i+1] * (t-i), r)        # --theano.lt: less than    theano.ifelse: b if a, c if not a
         if lo < hi:
             r = theano.ifelse.ifelse(T.le(t, lo), v[lo], r)
         return r

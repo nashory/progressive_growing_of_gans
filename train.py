@@ -76,7 +76,7 @@ def load_dataset_for_previous_run(result_subdir, **kwargs):
     return load_dataset(dataset, **kwargs)
 
 #----------------------------------------------------------------------------
-
+# training loop
 def train_gan(
     separate_funcs          = False,
     D_training_repeats      = 1,
@@ -112,13 +112,16 @@ def train_gan(
     resume_time             = 0.0):
 
     # Load dataset and build networks.
+    # --drange_orig = [0, 255]
     training_set, drange_orig = load_dataset()
     if resume_network_pkl:
         print 'Resuming', resume_network_pkl
         G, D, _ = misc.load_pkl(os.path.join(config.result_dir, resume_network_pkl))
     else:
+        # --Define network and load.
         G = network.Network(num_channels=training_set.shape[1], resolution=training_set.shape[2], label_size=training_set.labels.shape[1], **config.G)
         D = network.Network(num_channels=training_set.shape[1], resolution=training_set.shape[2], label_size=training_set.labels.shape[1], **config.D)
+    # --why make shallow copy?
     Gs = G.create_temporally_smoothed_version(beta=G_smoothing, explicit_updates=True)
     misc.print_network_topology_info(G.output_layers)
     misc.print_network_topology_info(D.output_layers)
@@ -146,22 +149,27 @@ def train_gan(
         raise ValueError('Invalid image_grid_type', image_grid_type)
 
     # Theano input variables and compile generation func.
+    # --input variables. ==> real image, noise, real labels fake labels.
     print 'Setting up Theano...'
     real_images_var  = T.TensorType('float32', [False] * len(D.input_shape))            ('real_images_var')
     real_labels_var  = T.TensorType('float32', [False] * len(training_set.labels.shape))('real_labels_var')
     fake_latents_var = T.TensorType('float32', [False] * len(G.input_shape))            ('fake_latents_var')
     fake_labels_var  = T.TensorType('float32', [False] * len(training_set.labels.shape))('fake_labels_var')
+    
+    # --what is shared??? what is it for?
     G_lrate = theano.shared(np.float32(0.0))
     D_lrate = theano.shared(np.float32(0.0))
     gen_fn = theano.function([fake_latents_var, fake_labels_var], Gs.eval_nd(fake_latents_var, fake_labels_var, ignore_unused_inputs=True), on_unused_input='ignore')
 
     # Misc init.
-    resolution_log2 = int(np.round(np.log2(G.output_shape[2])))
-    initial_lod = max(resolution_log2 - int(np.round(np.log2(lod_initial_resolution))), 0)
+    resolution_log2 = int(np.round(np.log2(G.output_shape[2])))         # --log2(height of output generator) why is it resolution??????? Resolution: log2(4)=2, log(8)=3, log(16)=4 ...
+    initial_lod = max(resolution_log2 - int(np.round(np.log2(lod_initial_resolution))), 0)          # --lod_initial_resolution = 4   if G.output_shape is more than initial resolution, set current resolution as G.output_shape.
     cur_lod = 0.0
     min_lod, max_lod = -1.0, -2.0
     fake_score_avg = 0.0
 
+
+    # --what is this for??
     if config.D.get('mbdisc_kernels', None):
         print 'Initializing minibatch discrimination...'
         if hasattr(D, 'cur_lod'): D.cur_lod.set_value(np.float32(initial_lod))
@@ -170,7 +178,7 @@ def train_gan(
         init_updates = [update for layer in init_layers for update in getattr(layer, 'init_updates', [])]
         init_fn = theano.function(inputs=[real_images_var], outputs=None, updates=init_updates)
         init_reals = training_set.get_random_minibatch(500, lod=initial_lod)
-        init_reals = misc.adjust_dynamic_range(init_reals, drange_orig, drange_net)
+        init_reals = misc.adjust_dynamic_range(init_reals, drange_orig, drange_net)       # convert image from [0, 255] to [-1, 1]  
         init_fn(init_reals)
         del init_reals
 
@@ -181,7 +189,7 @@ def train_gan(
     misc.save_image_grid(snapshot_fake_images, os.path.join(result_subdir, 'fakes%06d.png' % 0), drange=drange_viz, grid_size=image_grid_size)
 
     # Training loop.
-    cur_nimg = int(resume_kimg * 1000)
+    cur_nimg = int(resume_kimg * 1000)          # --why multiply 1000? resume_kimg is set as 0.0 initially. cur_nimg=0,1000,2000,3000,4000... 
     cur_tick = 0
     tick_start_nimg = cur_nimg
     tick_start_time = time.time()
@@ -190,50 +198,63 @@ def train_gan(
     while cur_nimg < total_kimg * 1000:
 
         # Calculate current LOD.
-        cur_lod = initial_lod
-        if lod_training_kimg or lod_transition_kimg:
-            tlod = (cur_nimg / 1000.0) / (lod_training_kimg + lod_transition_kimg)
-            cur_lod -= np.floor(tlod)
+        cur_lod = initial_lod                                   ## --curlod=4    initial_lod=4
+        if lod_training_kimg or lod_transition_kimg:            # --lod_training_kimg=400, lod_transition_kimg=400
+            tlod = (cur_nimg / 1000.0) / (lod_training_kimg + lod_transition_kimg)      # --tlod=0/800, 1/800, 2/800, 3/800, ..... 
+            cur_lod -= np.floor(tlod)                           # --cur_lod = 4, 4-1/800, 4-2/800, 4-3/800, .... ==> 4, 4, 4, 4, ... 3, 3, 3, 3,  ... 2, 2, 2,2 , .... 1, 1, 1, 1 ...
             if lod_transition_kimg:
                 cur_lod -= max(1.0 + (np.fmod(tlod, 1.0) - 1.0) * (lod_training_kimg + lod_transition_kimg) / lod_transition_kimg, 0.0)
-            cur_lod = max(cur_lod, 0.0)
+            cur_lod = max(cur_lod, 0.0)                         # --cur_lod should be at least 0.
 
         # Look up resolution-dependent parameters.
-        cur_res = 2 ** (resolution_log2 - int(np.floor(cur_lod)))
-        minibatch_size = minibatch_overrides.get(cur_res, minibatch_default)
-        tick_duration_kimg = tick_kimg_overrides.get(cur_res, tick_kimg_default)
+        cur_res = 2 ** (resolution_log2 - int(np.floor(cur_lod)))       # --res_log2=2    np.floor(cur_lod) = 4,3,2,1  ???
+        minibatch_size = minibatch_overrides.get(cur_res, minibatch_default)            # --???
+        tick_duration_kimg = tick_kimg_overrides.get(cur_res, tick_kimg_default)        # --when cur_res=32, get=20, cur_res=64, get=10, or else get=50(tick_kimg_default)
 
         # Update network config.
-        lrate_coef = misc.rampup(cur_nimg / 1000.0, rampup_kimg)
+        lrate_coef = misc.rampup(cur_nimg / 1000.0, rampup_kimg)        # --what is rampup?? rampup_kimg=40, cur_nimg=epoch, 1epoch=1000??? rampup_kimg=rampup_length 
+                                                                        # --exponentially increase from 0 to 1 (exp(-0.5*x^2)), this sets learning rate.
+                                                                        # --I think this part prevents sudden shock to the network.
         lrate_coef *= misc.rampdown_linear(cur_nimg / 1000.0, total_kimg, rampdown_kimg)
-        G_lrate.set_value(np.float32(lrate_coef * G_learning_rate_max))
+        G_lrate.set_value(np.float32(lrate_coef * G_learning_rate_max))     # --lr will slowly increase from 0 to 0.001
         D_lrate.set_value(np.float32(lrate_coef * D_learning_rate_max))
         if hasattr(G, 'cur_lod'): G.cur_lod.set_value(np.float32(cur_lod))
         if hasattr(D, 'cur_lod'): D.cur_lod.set_value(np.float32(cur_lod))
 
         # Setup training func for current LOD.
-        new_min_lod, new_max_lod = int(np.floor(cur_lod)), int(np.ceil(cur_lod))
-        if min_lod != new_min_lod or max_lod != new_max_lod:
+        new_min_lod, new_max_lod = int(np.floor(cur_lod)), int(np.ceil(cur_lod))    # --?? if cur_lod = 7.4 then new_min_lod = 7, new_max_lod=8
+        
+        # --if min_lod / max_lod is changed, lets do below.
+        if min_lod != new_min_lod or max_lod != new_max_lod:                        # --min_lod? new_min_lod?       min_lod=-1, max_lod=-2
             print 'Compiling training funcs...'
             min_lod, max_lod = new_min_lod, new_max_lod
 
             # Pre-process reals.
-            real_images_expr = real_images_var
-            if dequantize_reals:
+            real_images_expr = real_images_var          # --what is the difference??
+                                                        # --I think real_images_var is x (real image) in range of [-1,1], and real_image_expr is x in range of [0,255]
+            
+            
+            if dequantize_reals:                    # --I will ignore this part.
                 rnd = theano.sandbox.rng_mrg.MRG_RandomStreams(lasagne.random.get_rng().randint(1, 2147462579))
                 epsilon_noise = rnd.uniform(size=real_images_expr.shape, low=-0.5, high=0.5, dtype='float32')
                 real_images_expr = T.cast(real_images_expr, 'float32') + epsilon_noise # match original implementation of Improved Wasserstein
-            real_images_expr = misc.adjust_dynamic_range(real_images_expr, drange_orig, drange_net)
+
+                
+            real_images_expr = misc.adjust_dynamic_range(real_images_expr, drange_orig, drange_net)     # --adjust range of pixel. drange_net=[-1,1], drange_orig=[0,255]
+                                                                                                        # --now, the pixel range of real_images_expr is [0,255]
             if min_lod > 0: # compensate for shrink_based_on_lod
-                real_images_expr = T.extra_ops.repeat(real_images_expr, 2**min_lod, axis=2)
+                real_images_expr = T.extra_ops.repeat(real_images_expr, 2**min_lod, axis=2)         # --repeats elements of array.
                 real_images_expr = T.extra_ops.repeat(real_images_expr, 2**min_lod, axis=3)
 
             # Optimize loss.
+            # --they used adam optimizer.
+            # -- evaluate_loss might include foward process.
             G_loss, D_loss, real_scores_out, fake_scores_out = evaluate_loss(G, D, min_lod, max_lod, real_images_expr, real_labels_var, fake_latents_var, fake_labels_var, **config.loss)
             G_updates = adam(G_loss, G.trainable_params(), learning_rate=G_lrate, beta1=adam_beta1, beta2=adam_beta2, epsilon=adam_epsilon).items()
             D_updates = adam(D_loss, D.trainable_params(), learning_rate=D_lrate, beta1=adam_beta1, beta2=adam_beta2, epsilon=adam_epsilon).items()
 
             # Compile training funcs.
+            # --theano function needs compiliation. Then GD_train_fn becomes a function.
             if not separate_funcs:
                 GD_train_fn = theano.function(
                     [real_images_var, real_labels_var, fake_latents_var, fake_labels_var],
@@ -265,6 +286,7 @@ def train_gan(
                 tick_train_out.append(mb_train_out)
             G_train_fn(random_latents(minibatch_size, G.input_shape), random_labels(minibatch_size, training_set))
 
+        
         # Fade in D noise if we're close to becoming unstable
         fake_score_cur = np.clip(np.mean(mb_train_out[1]), 0.0, 1.0)
         fake_score_avg = fake_score_avg * gdrop_beta + fake_score_cur * (1.0 - gdrop_beta)
